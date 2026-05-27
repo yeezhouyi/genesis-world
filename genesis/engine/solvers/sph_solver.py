@@ -35,6 +35,7 @@ class SPHSolver(Solver):
         self._df_max_div_iters = options.max_divergence_solver_iterations
         self._df_max_den_iters = options.max_density_solver_iterations
         self._df_eps = 1e-5
+        self._warm_start = options.warm_start
 
         self._upper_bound = np.array(options.upper_bound)
         self._lower_bound = np.array(options.lower_bound)
@@ -69,6 +70,8 @@ class SPHSolver(Solver):
             p=gs.qd_float,  # pressure
             dfsph_factor=gs.qd_float,  # DFSPH use: Factor for Divergence and density solver
             drho=gs.qd_float,  # density deritivate
+            kappa_v=gs.qd_float,  # warm start: stored kappa for divergence solver
+            kappa_d=gs.qd_float,  # warm start: stored kappa for density solver
         )
 
         # dynamic particle state without gradient
@@ -482,8 +485,6 @@ class SPHSolver(Solver):
                 b_i = self.particles_reordered[i_p, i_b].drho
                 k_i = b_i * self.particles_reordered[i_p, i_b].dfsph_factor
                 ret = qd.Struct(dv=qd.Vector.zero(gs.qd_float, 3), k_i=k_i)
-                # TODO: if warm start
-                # get_kappa_V += k_i
                 self.sh.for_all_neighbors(
                     i_p,
                     self.particles_reordered.pos,
@@ -508,12 +509,53 @@ class SPHSolver(Solver):
         density_err = self._kernel_compute_density_error(0.0)
         return density_err / self._n_particles
 
+    @qd.func
+    def _task_warm_start_divergence(self, i, j, ret: qd.template(), i_b):
+        k_j = self.particles_reordered[j, i_b].kappa_v
+        k_sum = ret.k_i + k_j  # k_i from previous frame's kappa_v[i]
+        if qd.abs(k_sum) > self._df_eps:
+            grad_p_j = -self._particle_volume * self.cubic_kernel_derivative(
+                self.particles_reordered.pos[i, i_b] - self.particles_reordered.pos[j, i_b]
+            )
+            ret.dv -= k_sum * grad_p_j
+
+    @qd.kernel
+    def _kernel_warm_start_divergence(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active:
+                k_i = self.particles_reordered[i_p, i_b].kappa_v
+                dv = qd.Vector.zero(gs.qd_float, 3)
+                ret = qd.Struct(dv=dv, k_i=k_i)
+                self.sh.for_all_neighbors(
+                    i_p,
+                    self.particles_reordered.pos,
+                    self._support_radius,
+                    ret,
+                    self._task_warm_start_divergence,
+                    i_b,
+                )
+                self.particles_reordered[i_p, i_b].vel += ret.dv
+
+    @qd.kernel
+    def _kernel_store_kappa_v(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active:
+                b_i = self.particles_reordered[i_p, i_b].drho
+                self.particles_reordered[i_p, i_b].kappa_v = b_i * self.particles_reordered[i_p, i_b].dfsph_factor
+
     def _divergence_solve(self, f: qd.i32):
-        # TODO: warm start
+        # Apply warm start using kappa_v stored from previous substep
+        if self._warm_start:
+            self._kernel_warm_start_divergence(f)
+
         # Compute velocity of density change
         self._kernel_compute_density_time_derivative()
         inv_dt = 1 / self._substep_dt
         # self._kernel_multiply_time_step(self.ps.dfsph_factor, inv_dt)
+
+        # Store kappa_v for next substep's warm start
+        if self._warm_start:
+            self._kernel_store_kappa_v(f)
 
         # Start solver
         iteration = 0
@@ -532,9 +574,6 @@ class SPHSolver(Solver):
         # Multiply by h, the time step size has to be removed
         # to make the stiffness value independent
         # of the time step size
-
-        # TODO: if warm start
-        # also remove for kappa v
 
         # self._kernel_multiply_time_step(self.ps.dfsph_factor, self.dt[None])
 
@@ -592,8 +631,6 @@ class SPHSolver(Solver):
 
                 ret = qd.Struct(dv=qd.Vector.zero(gs.qd_float, 3), k_i=k_i)
 
-                # TODO: if warmstart
-                # get kappa V
                 self.sh.for_all_neighbors(
                     i_p, self.particles_reordered.pos, self._support_radius, ret, self.density_solve_iteration_task, i_b
                 )
@@ -611,11 +648,54 @@ class SPHSolver(Solver):
             if self.particles_ng_reordered[i_p, i_b].active:
                 field[i_p, i_b] *= time_step
 
+    @qd.func
+    def _task_warm_start_density(self, i, j, ret: qd.template(), i_b):
+        k_j = self.particles_reordered[j, i_b].kappa_d
+        k_sum = ret.k_i + k_j  # k_i from previous frame's kappa_d[i]
+        if qd.abs(k_sum) > self._df_eps:
+            grad_p_j = -self._particle_volume * self.cubic_kernel_derivative(
+                self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
+            )
+            ret.dv -= self._substep_dt * k_sum * grad_p_j
+
+    @qd.kernel
+    def _kernel_warm_start_density(self, f: qd.i32):
+        # Apply warm start using kappa_d stored from previous substep
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active:
+                k_i = self.particles_reordered[i_p, i_b].kappa_d
+                dv = qd.Vector.zero(gs.qd_float, 3)
+                ret = qd.Struct(dv=dv, k_i=k_i)
+                self.sh.for_all_neighbors(
+                    i_p,
+                    self.particles_reordered.pos,
+                    self._support_radius,
+                    ret,
+                    self._task_warm_start_density,
+                    i_b,
+                )
+                self.particles_reordered[i_p, i_b].vel += ret.dv
+
+    @qd.kernel
+    def _kernel_store_kappa_d(self, f: qd.i32):
+        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+            if self.particles_ng_reordered[i_p, i_b].active:
+                b_i = self.particles_reordered[i_p, i_b].drho - 1.0
+                self.particles_reordered[i_p, i_b].kappa_d = b_i * self.particles_reordered[i_p, i_b].dfsph_factor
+
     def _density_solve(self, f: qd.i32):
         inv_dt2 = 1.0 / self._substep_dt**2
 
+        # Apply warm start using kappa_d stored from previous substep
+        if self._warm_start:
+            self._kernel_warm_start_density(f)
+
         # Compute density star
         self._kernel_compute_density_star()
+
+        # Store kappa_d for next substep's warm start
+        if self._warm_start:
+            self._kernel_store_kappa_d(f)
 
         self._kernel_multiply_time_step(self.particles_reordered.dfsph_factor, inv_dt2)
 

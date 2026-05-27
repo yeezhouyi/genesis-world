@@ -650,6 +650,8 @@ class SPHOptions(Options):
         Maximum number of iterations for the divergence solver. Defaults to 100.
     max_density_solver_iterations : int, optional
         Maximum number of iterations for the density solver. Defaults to 100.
+    warm_start : bool, optional
+        Whether to warm-start the DFSPH pressure solver using the previous substep's pressure field as the initial guess, reducing the number of solver iterations needed. Defaults to True.
     """
 
     dt: PositiveFloat | None = None
@@ -669,6 +671,7 @@ class SPHOptions(Options):
     max_density_error_percent: PositiveFloat = 0.05  # This is percent
     max_divergence_solver_iterations: PositiveInt = 100
     max_density_solver_iterations: PositiveInt = 100
+    warm_start: bool = True  # whether to warm-start the DFSPH solver
 
     _support_radius: float = PrivateAttr(default=0.0)
     _hash_grid_res: np.ndarray = PrivateAttr(default=None)
